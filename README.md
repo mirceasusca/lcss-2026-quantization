@@ -1,2 +1,2 @@
 # lcss-2026-quantization
-Source code and experiment appendix to LCSS paper on non-uniform quantizer synthesis.
+Source code and experiment appendix to LCSS paper on non-uniform quantizer synthesis using dynamic programming for LQI tracking control structures. Also provides source code for plots generated for the letter paper.
