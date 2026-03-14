@@ -8,8 +8,9 @@
 
 % DONE: Works correctly if you let the steady-state stay enough 
 % in the trajectory
-% TODO: define a number of full trajectories + 
+% DONE: define a number of full trajectories + 
 % define a number of initializations to the first part of the trajectory
+% DONE: added regularization through reference definition and state update
 
 clear; clc; close all;
 rng(7);
@@ -26,17 +27,14 @@ B = [1;0.5];
 C = [1,1];
 D = 0;
 
-n = size(A,1);   % = 2
-m = size(B,2);   % = 1
-p = size(C,1);   % = 1
-
-% LQI integrator gain T (paper notation, scalar in SISO)
-Ti = Ts;   % T = Ts for forward-Euler-like discrete integrator
+n = size(A,1);
+m = size(B,2);
+p = size(C,1);
 
 % Augmented nominal (unquantized) servo dynamics
-% xi = [x; z],  z_{k+1} = z_k + Ti (r_k - y_k)
+% xi = [x; z],  z_{k+1} = z_k + Ts (r_k - y_k)
 Aaug = [A,            zeros(n,p);
-       -Ti*C,         eye(p)];
+       -Ts*C,         eye(p)];
 Baug = [B; zeros(p,m)];
 
 % LQI/LQR weights on augmented state and command
@@ -53,12 +51,12 @@ Kz = Kfull(:,n+1:end);     % 1x1
 
 % Closed-loop matrices in manuscript form
 Acl = [A + B*Kx,   B*Kz;
-      -Ti*C,       1];
+      -Ts*C,       1];
 Gx = [B*Kx;
       zeros(p,n)];          % size (n+p) x n = 3x2
 Gy = [zeros(n,p);
-     -Ti*eye(p)];           % size (n+p) x p = 3x1
-E = [zeros(n,p); Ti*eye(p)]; % not used here (regulation form)
+     -Ts*eye(p)];           % size (n+p) x p = 3x1
+E = [zeros(n,p); Ts*eye(p)]; % not used here (regulation form)
 
 fprintf('\n=== Open-loop checks ===\n');
 fprintf('eig(Acl) = \n');
@@ -76,14 +74,13 @@ assert(all(abs(eig(Acl)) < 1), 'Acl is not Schur. Retune Qaug/R.');
 figure('Name','Closed-loop ideal step response')
 step(ss(Acl,E,[C,0],0,Ts))
 
+% settling time to know how much the step response should take
 stepperf = stepinfo(ss(Acl,E,[C,0],0,Ts));
 settlingTime = stepperf.SettlingTime
 
 %% ============================================
 % Reference signal for evaluation/training
 % ============================================
-
-% @USERTODO: define adequate tfin_sim for requested experiment
 
 % num_windows = 3
 % gamma = 0.98;   % discounted command-distortion factor
@@ -148,8 +145,6 @@ z0_box     = 1;       % random z0 in [-z0_box, z0_box]
 % Theorem 2 quantities
 % Qu = K' R K (here R scalar)
 % Qu = Kfull' * R * Kfull; % old; u only
-% Qdelta = Qaug/25/2/10;
-% Qdelta = Qaug*0;
 Qdelta = Qaug; 
 Qu = Qdelta + Kfull' * R * Kfull;
 Qu = (Qu+Qu')/2;
@@ -160,7 +155,7 @@ Qu = (Qu+Qu')/2;
 % Use A = sqrt(gamma)*Acl'
 Su = dlyap(sqrt(gamma)*Acl', Qu);
 
-Wx_u = Gx' * Su * Gx + Kx' * R * Kx;  % 2x2
+Wx_u = Gx' * Su * Gx + Kx' * R * Kx;   % 2x2
 Wy_u = Gy' * Su * Gy;                  % 1x1
 
 % Corollary row-sum weights (sufficient separable bound)
@@ -179,7 +174,6 @@ disp('alpha_y ='); disp(alpha_y.');
 % Regulation / deviation case (r_k = 0)
 % We collect ideal trajectories and design quantizers from x,y samples.
 
-% nTrainTraj = 500;
 nTrainTraj = 500;
 % nTrainTraj = 200;
 % nTrainTraj = 100;
@@ -190,16 +184,16 @@ nTrainTraj = 500;
 % Htrain     = 600;
 Htrain = round(tfin_sim/Ts);
 %
-% nTestTraj = 250;
+% truncated discounted horizon
 nTestTraj = 250;
 % nTestTraj = 50;
 % nTestTraj = 20;
-% Heval     = 180;  % truncated discounted horizon
-%
+
+% Heval     = 180;
 Heval     = Htrain;  % truncated discounted horizon
 
-% train = collect_ideal_dataset(A, B, C, Kx, Kz, Ti, nTrainTraj, Htrain, x0_box, z0_box, gamma);
-train = collect_ideal_dataset_ref(A, B, C, Kx, Kz, Ti, nTrainTraj, Htrain, x0_box, z0_box, gamma, refCfg);
+train = collect_ideal_dataset_ref(A, B, C, Kx, Kz, Ts, nTrainTraj, ...
+    Htrain, x0_box, z0_box, gamma, refCfg);
 
 % Training arrays
 x1_samples = train.x(:,1);
@@ -337,11 +331,8 @@ for im = 1:numel(methods)
     nm = methods{im};
     qbundle = Qset.(nm);
 
-    % out = evaluate_quantized_case( ...
-    %     A, B, C, Kx, Kz, Ti, R, gamma, ...
-    %     Wx_u, Wy_u, qbundle, testset, Heval);
     out = evaluate_quantized_case_ref( ...
-        A, B, C, Kx, Kz, Ti, Qdelta, R, gamma, ...
+        A, B, C, Kx, Kz, Ts, Qdelta, R, gamma, ...
         Wx_u, Wy_u, qbundle, testset, Heval, refCfg,Sx,Sy);
 
     results.(nm) = out;
@@ -424,7 +415,7 @@ traj = struct();
 for im = 1:numel(methods)
     nm = methods{im};
     traj.(nm) = simulate_single_trajectory_ref( ...
-        A, B, C, Kx, Kz, Ti, R, gamma, Wx_u, Wy_u, ...
+        A, B, C, Kx, Kz, Ts, R, gamma, Wx_u, Wy_u, ...
         Qset.(nm), x0_example, Heval, refCfg);
 end
 
@@ -537,44 +528,6 @@ for im = 1:numel(methods)
     title(sprintf('%s (rectangular partition)', nm));
     xlabel('x_1'); ylabel('x_2');
 end
-
-% %% ==========================================
-% % 11) LCSS PLOT (Short summary of others)
-% % ===========================================
-% figure('Name','LCSS')
-% 
-% % subplot(2,3,[1,2,3]), hold on; grid on;
-% subplot(3,3,[1,2,3]), hold on; grid on;
-% plot(t(idxTail), rseq(idxTail), '--', 'LineWidth', 1.2);
-% % plot(t(idxTail), y_id(idxTail), 'k', 'LineWidth', 1.3);
-% for im = 1:numel(methods)
-%     nm = methods{im};
-%     if im == 4
-%         plot(t(idxTail), traj.(nm).y(idxTail), 'b', 'LineWidth', 1.0);
-%     else
-%         plot(t(idxTail), traj.(nm).y(idxTail), 'r', 'LineWidth', 1.0);
-%     end
-% end
-% % legend(cell(['ref','ideal',methods]), 'Location','best');
-% % legend('ref','ideal','uniform','log','kmeans','proposed', 'Location','best');
-% legend('ref','uniform','log','kmeans','proposed', 'Location','best');
-% xlabel('k'); ylabel('y_k');
-% title('Zoom (output)');
-% 
-% % subplot(2,3,4)
-% subplot(3,3,4)
-% histogram(train.x(:,1),100,'normalization','pdf')
-% % 
-% % subplot(2,3,[5,6])
-% subplot(3,3,[5,6])
-% plot_centroid_stems_LCSS(Qset, methods, 'x_1 centroids', 'x', 1);
-% 
-% subplot(3,3,7)
-% histogram(train.y,100,'normalization','pdf')
-% 
-% % subplot(2,3,[5,6])
-% subplot(3,3,[8,9])
-% plot_centroid_stems_LCSS(Qset, methods, 'y centroids', 'y', 1);
 
 %% ==========================================
 % 11) LCSS PLOT (Short summary of others)
@@ -987,32 +940,6 @@ function [qv, overload] = quantize_scalar(v, q)
     end
 end
 
-% function r = reference_at_k(k, refCfg)
-%     switch lower(refCfg.type)
-%         case 'const'
-%             r = refCfg.r0;
-% 
-%         case 'sine'
-%             % r_k = bias + amp*sin(2*pi*freq*k)
-%             bias = getfield_with_default(refCfg, 'bias', 0);
-%             r = bias + refCfg.amp * sin(2*pi*refCfg.freq*k);
-% 
-%         case 'piecewise'
-%             % switch_k must start at 0, values same length
-%             idx = find(refCfg.switch_k <= k, 1, 'last');
-%             if isempty(idx), idx = 1; end
-%             r = refCfg.values(idx);
-% 
-%         % case 'mixed'
-%         %     idx = find(refCfg.switch_k <= k, 1, 'last');
-%         %     if isempty(idx), idx = 1; end
-%         %     r = refCfg.values(idx);
-% 
-%         otherwise
-%             error('Unknown refCfg.type = %s', refCfg.type);
-%     end
-% end
-
 function r = reference_at_k(k, refCfg)
     switch lower(refCfg.type)
 
@@ -1081,7 +1008,7 @@ function v = getfield_with_default(s, fname, vdefault)
     if isfield(s, fname), v = s.(fname); else, v = vdefault; end
 end
 
-function data = collect_ideal_dataset_ref(A,B,C,Kx,Kz,Ti,nTraj,H,x0_box,z0_box,gamma,refCfg)
+function data = collect_ideal_dataset_ref(A,B,C,Kx,Kz,Ts,nTraj,H,x0_box,z0_box,gamma,refCfg)
     n = size(A,1);
     X = [];
     Y = [];
@@ -1118,7 +1045,7 @@ function data = collect_ideal_dataset_ref(A,B,C,Kx,Kz,Ti,nTraj,H,x0_box,z0_box,g
             end
             
             x_next = A*x + B*u+wk;
-            z_next = z + Ti*(r - y);      % ideal integrator uses unquantized y
+            z_next = z + Ts*(r - y);      % ideal integrator uses unquantized y
 
             x = x_next; z = z_next;
         end
@@ -1140,7 +1067,7 @@ function data = collect_ideal_dataset_ref(A,B,C,Kx,Kz,Ti,nTraj,H,x0_box,z0_box,g
     subplot(414),plot(data.r)
 end
 
-function out = evaluate_quantized_case_ref(A,B,C,Kx,Kz,Ti,Qdelta,R,gamma,Wx_u,Wy_u,qbundle,testset,Heval,refCfg,Sx,Sy)
+function out = evaluate_quantized_case_ref(A,B,C,Kx,Kz,Ts,Qdelta,R,gamma,Wx_u,Wy_u,qbundle,testset,Heval,refCfg,Sx,Sy)
     nTraj = size(testset,1);
     Ju = zeros(nTraj,1);
     Js = zeros(nTraj,1);
@@ -1196,10 +1123,10 @@ function out = evaluate_quantized_case_ref(A,B,C,Kx,Kz,Ti,Qdelta,R,gamma,Wx_u,Wy
 
             % Step both systems with SAME reference
             x_next  = A*x  + B*u;
-            z_next  = z  + Ti*(r - yq);  % quantized output in integrator
+            z_next  = z  + Ts*(r - yq);  % quantized output in integrator
 
             xs_next = A*xs + B*us;
-            zs_next = zs + Ti*(r - ys);  % ideal output in integrator
+            zs_next = zs + Ts*(r - ys);  % ideal output in integrator
 
             xi_q   = [x_next;  z_next];
             xi_ref = [xs_next; zs_next];
@@ -1224,7 +1151,7 @@ function out = evaluate_quantized_case_ref(A,B,C,Kx,Kz,Ti,Qdelta,R,gamma,Wx_u,Wy
     out.total_quant_calls = total_quant_calls;
 end
 
-function traj = simulate_single_trajectory_ref(A,B,C,Kx,Kz,Ti,R,gamma,Wx_u,Wy_u,qbundle,x0_aug,Heval,refCfg)
+function traj = simulate_single_trajectory_ref(A,B,C,Kx,Kz,Ts,R,gamma,Wx_u,Wy_u,qbundle,x0_aug,Heval,refCfg)
     % gamma, R, Wx_u, Wy_u kept for possible extensions
     xi_q   = x0_aug(:);
     xi_ref = x0_aug(:);
@@ -1266,8 +1193,8 @@ function traj = simulate_single_trajectory_ref(A,B,C,Kx,Kz,Ti,R,gamma,Wx_u,Wy_u,
         traj.y_ideal(ii)  = ys;    traj.u_ideal(ii)  = us;
 
         % step
-        xi_q   = [A*x + B*u;     z  + Ti*(r - yq)];
-        xi_ref = [A*xs + B*us;   zs + Ti*(r - ys)];
+        xi_q   = [A*x + B*u;     z  + Ts*(r - yq)];
+        xi_ref = [A*xs + B*us;   zs + Ts*(r - ys)];
     end
 end
 
