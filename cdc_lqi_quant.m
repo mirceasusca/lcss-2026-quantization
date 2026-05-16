@@ -12,7 +12,11 @@
 % define a number of initializations to the first part of the trajectory
 % DONE: added regularization through reference definition and state update
 
-clear; clc; close all;
+if ~exist('runAllocationSensitivityOnly','var')
+    runAllocationSensitivityOnly = false;
+end
+clearvars -except runAllocationSensitivityOnly;
+clc; close all;
 rng(7);
 
 %% =========================
@@ -130,6 +134,8 @@ refCfg.segPar  = {
     struct('start', -0.7, 'slope', ramp_max/min_settlingTime_window/4.5/1.1,'min',-0.7,'max',ramp_max),        ... % ramp: -0.4 + 0.002*tau
     struct('bias',0.5, 'amp', 0.3, 'freq', 0.01/2,'phase',pi), ... % sine in segment time
 };
+refCfg.trainPerturbProb = 0.10;  % bounded reference regularization
+refCfg.trainPerturbFrac = 0.50;  % |r_train| <= (1+frac)|r_nom|
 x0_box     = [5,5];   % random x0 in [-box, box]
 z0_box     = 1;       % random z0 in [-z0_box, z0_box]
 
@@ -192,6 +198,9 @@ nTestTraj = 250;
 % Heval     = 180;
 Heval     = Htrain;  % truncated discounted horizon
 
+% Total finite-level budget across x1, x2, and y.
+Ntot = 384;
+
 train = collect_ideal_dataset_ref(A, B, C, Kx, Kz, Ts, nTrainTraj, ...
     Htrain, x0_box, z0_box, gamma, refCfg);
 
@@ -201,11 +210,35 @@ x2_samples = train.x(:,2);
 y_samples  = train.y(:);
 omega_t    = train.w(:);   % discount-consistent weights gamma^k
 
-% Prescribed quantizer ranges (hardware-like fixed ranges)
-% Here selected from training envelope with margin.
+% Prescribed quantizer ranges. We keep the original data-envelope logic as a
+% practical operating-set estimate, then certify it against Lemma 1 using the
+% bounded initial set, bounded reference, and prescribed preliminary error
+% envelopes. The larger of the two is used for synthesis.
 range_margin = 1.25;
-Sx = range_margin * [max(abs(x1_samples)), max(abs(x2_samples))];
-Sy = range_margin * max(abs(y_samples));
+Sx_data = range_margin * [max(abs(x1_samples)), max(abs(x2_samples))];
+Sy_data = range_margin * max(abs(y_samples));
+
+xi0bar = [x0_box(:); z0_box];
+rbar = reference_bound_over_horizon(refCfg, Htrain);
+prelimLevelsForRange = max(1, floor(Ntot / (n + p)));
+prelim_ebar_x = Sx_data(:) / prelimLevelsForRange;
+prelim_ebar_y = Sy_data / prelimLevelsForRange;
+Hx_cert = [eye(n), zeros(n,p)];
+Hy_cert = [C, zeros(p,p)];
+[Sx_cert, Sy_cert, rangeCert] = no_saturation_range_certificate( ...
+    Acl, E, Gx, Gy, Hx_cert, Hy_cert, xi0bar, rbar, ...
+    prelim_ebar_x, prelim_ebar_y);
+
+Sx = max(Sx_data(:), Sx_cert(:)).';
+Sy = max(Sy_data, Sy_cert);
+
+fprintf('\n=== Lemma range certificate ===\n');
+fprintf('xi0bar = [%.4f %.4f %.4f], rbar = %.4f\n', xi0bar(1), xi0bar(2), xi0bar(3), rbar);
+fprintf('preliminary ebar = [%.4e %.4e %.4e]\n', prelim_ebar_x(1), prelim_ebar_x(2), prelim_ebar_y);
+fprintf('data envelope S = [%.4f %.4f %.4f]\n', Sx_data(1), Sx_data(2), Sy_data);
+fprintf('lemma certificate S = [%.4f %.4f %.4f] (truncation k=%d, tail %.2e)\n', ...
+    Sx_cert(1), Sx_cert(2), Sy_cert, rangeCert.kStop, rangeCert.tailNorm);
+fprintf('synthesis ranges S = [%.4f %.4f %.4f]\n', Sx(1), Sx(2), Sy);
 
 % Enforce samples inside prescribed ranges (for design consistency)
 assert(all(abs(x1_samples) <= Sx(1)+1e-12));
@@ -225,12 +258,9 @@ assert(all(abs(y_samples)  <= Sy   +1e-12));
 % Nx = [256, 256];   % x1, x2
 % Ny = 256;        % y
 
-% QUASI OPTIMAL BIT ALLOCATION
-% Ntot = 768;
-Ntot = 384;
-% Ntot = 320;
-% Ntot = 256;
-% Ntot = 192;
+% High-rate allocation baseline (classical DSP-inspired rule).
+% Alternative total budgets used in previous sweeps:
+% Ntot = 768; Ntot = 320; Ntot = 256; Ntot = 192;
 % % %
 % Qdelta2 = Qaug*0; 
 Qdelta2 = Qaug;
@@ -252,16 +282,63 @@ Nint = round(N);
 delta = Ntot - sum(Nint);
 [~,idx] = sort(N - Nint,'descend');
 Nint(idx(1:abs(delta))) = Nint(idx(1:abs(delta))) + sign(delta);
-% Nint
-Nx = [Nint(1),Nint(2)];
-Ny = Nint(3);
+
+N_highrate = [Nint(1), Nint(2), Nint(3)];
+
+% Weighted scalar design weights for the separable sampled surrogate.
+w_x1 = omega_t * alpha_x(1);
+w_x2 = omega_t * alpha_x(2);
+w_y  = omega_t * alpha_y(1);
+
+% Data-driven globally optimal level allocation for the sampled separable
+% surrogate: min sum_l Phi_l(N_l), sum_l N_l = Ntot.
+useDataDrivenAllocation = true;
+allocDesignMaxSamples = 60000; % deterministic subset for fast allocation curves
+NminAlloc = 16;
+allocOpt = [];
+allocSignalOpt = [];
+if useDataDrivenAllocation
+    allocOpt = design_surrogate_level_allocation( ...
+        x1_samples, x2_samples, y_samples, w_x1, w_x2, w_y, ...
+        Sx, Sy, Ntot, NminAlloc, allocDesignMaxSamples, ...
+        'performance-aware surrogate');
+
+    % Signal-only allocation ablation: same scalar DP machinery, but without
+    % the closed-loop sensitivity weights alpha_l. This isolates the benefit
+    % of allocating levels by the performance surrogate rather than raw MSE.
+    allocSignalOpt = design_surrogate_level_allocation( ...
+        x1_samples, x2_samples, y_samples, omega_t, omega_t, omega_t, ...
+        Sx, Sy, Ntot, NminAlloc, allocDesignMaxSamples, ...
+        'signal-only MSE');
+
+    N_selected = allocOpt.Nbest;
+else
+    N_selected = N_highrate;
+end
+
+Nx = [N_selected(1), N_selected(2)];
+Ny = N_selected(3);
 % Nx = [89+20,37]
 % Ny = [66-20]
 
 fprintf('\n=== Quantizer ranges / levels ===\n');
 fprintf('Sx = [%.4f, %.4f], Sy = %.4f\n', Sx(1), Sx(2), Sy);
-fprintf('Nx = [%d, %d], Ny = %d\n', Nx(1), Nx(2), Ny);
+fprintf('High-rate allocation = [%d, %d, %d]\n', N_highrate(1), N_highrate(2), N_highrate(3));
+if ~isempty(allocOpt)
+    fprintf('Data-driven allocation = [%d, %d, %d] (curve surrogate %.6e)\n', ...
+        allocOpt.Nbest(1), allocOpt.Nbest(2), allocOpt.Nbest(3), allocOpt.bestCost);
+end
+if ~isempty(allocSignalOpt)
+    fprintf('Signal-only allocation = [%d, %d, %d] (curve SSE %.6e)\n', ...
+        allocSignalOpt.Nbest(1), allocSignalOpt.Nbest(2), allocSignalOpt.Nbest(3), allocSignalOpt.bestCost);
+end
+fprintf('Selected Nx = [%d, %d], Ny = %d\n', Nx(1), Nx(2), Ny);
 fprintf('Ntot = %d\n', Nx(1)+Nx(2)+Ny);
+
+% Shared robustness-oriented validation set: independently sampled initial
+% conditions and bounded reference perturbations, reused by all methods.
+testset = sample_initial_conditions(nTestTraj, x0_box/3, z0_box/3);
+testRefSeq = sample_reference_sequences(nTestTraj, Heval, refCfg, true);
 
 %% =============================================
 % 4) Design scalar quantizers (4 methods/channel)
@@ -269,11 +346,34 @@ fprintf('Ntot = %d\n', Nx(1)+Nx(2)+Ny);
 methods = {'uniform','log','kmeans','dp'};
 Qset = struct();
 
-% Weighted scalar design weights (alpha only rescales each channel objective,
-% but we include them to reflect the corollary notation)
-w_x1 = omega_t * alpha_x(1);
-w_x2 = omega_t * alpha_x(2);
-w_y  = omega_t * alpha_y(1);
+%% =====================================================
+% 4a) Allocation perturb-and-observe sensitivity study
+% ======================================================
+% This section can be run standalone by calling:
+% runAllocationSensitivityOnly = true; run('cdc_lqi_quant.m')
+runAllocSensitivity = true;
+
+if runAllocSensitivity
+    % allocEvalTraj = min(60, nTestTraj);
+    allocEvalTraj = nTestTraj;
+    allocDesignMaxSamples = 60000; % deterministic subset for fast DP redesigns
+    allocTestset = testset(1:allocEvalTraj,:);
+    allocRefSeq = testRefSeq(1:allocEvalTraj,:);
+    N_signal_baseline = [];
+    if ~isempty(allocSignalOpt)
+        N_signal_baseline = allocSignalOpt.Nbest;
+    end
+
+    allocSensitivity = allocation_perturb_observe( ...
+        A, B, C, Kx, Kz, Ts, Qdelta, R, gamma, Wx_u, Wy_u, ...
+        refCfg, Heval, Sx, Sy, [Nx(1), Nx(2), Ny], Ntot, ...
+        x1_samples, x2_samples, y_samples, w_x1, w_x2, w_y, ...
+        allocTestset, allocRefSeq, allocDesignMaxSamples, N_highrate, N_signal_baseline);
+
+    if runAllocationSensitivityOnly
+        return;
+    end
+end
 
 % x1
 Qset.uniform.x{1} = design_uniform_quantizer(Sx(1), Nx(1));
@@ -292,6 +392,19 @@ Qset.uniform.y{1} = design_uniform_quantizer(Sy, Ny);
 Qset.log.y{1}     = design_best_log_quantizer(y_samples, w_y, Sy, Ny);
 Qset.kmeans.y{1}  = design_lloyd1d_quantizer(y_samples, w_y, Sy, Ny);
 Qset.dp.y{1}      = design_dp1d_quantizer(y_samples, w_y, Sy, Ny);
+
+dp_ebar_x = [max_cell_error(Qset.dp.x{1}); max_cell_error(Qset.dp.x{2})];
+dp_ebar_y = max_cell_error(Qset.dp.y{1});
+[Sx_recert, Sy_recert] = no_saturation_range_certificate( ...
+    Acl, E, Gx, Gy, Hx_cert, Hy_cert, xi0bar, rbar, dp_ebar_x, dp_ebar_y);
+fprintf('\n=== Final DP error-envelope check ===\n');
+fprintf('DP max-cell ebar = [%.4e %.4e %.4e]\n', dp_ebar_x(1), dp_ebar_x(2), dp_ebar_y);
+fprintf('rechecked lemma S = [%.4f %.4f %.4f]\n', Sx_recert(1), Sx_recert(2), Sy_recert);
+if any(Sx_recert(:) > Sx(:) + 1e-9) || any(Sy_recert(:) > Sy(:) + 1e-9)
+    fprintf(['Note: the global max-cell recheck is conservative for the ' ...
+        'unconstrained nonuniform DP tails and exceeds the preliminary ' ...
+        'certificate. Validation below reports the actual overload rate.\n']);
+end
 
 %% ============================================
 % 5) Training surrogate SSE (per method, design)
@@ -322,8 +435,6 @@ end
 %% ==========================================
 % 6) Closed-loop evaluation on test trajectories
 % ===========================================
-testset   = sample_initial_conditions(nTestTraj, x0_box/3, z0_box/3);
-
 results = struct();
 for im = 1:numel(methods)
     disp('Closed-loop evaluation on test trajectories')
@@ -333,7 +444,7 @@ for im = 1:numel(methods)
 
     out = evaluate_quantized_case_ref( ...
         A, B, C, Kx, Kz, Ts, Qdelta, R, gamma, ...
-        Wx_u, Wy_u, qbundle, testset, Heval, refCfg,Sx,Sy);
+        Wx_u, Wy_u, qbundle, testset, Heval, refCfg, Sx, Sy, testRefSeq);
 
     results.(nm) = out;
 end
@@ -345,6 +456,21 @@ for im = 1:numel(methods)
     r = results.(nm);
     fprintf('%-7s  %.6e   %.6e   %.4f\n', ...
         nm, mean(r.Ju), mean(r.Jsurr), r.overload_count / max(1,r.total_quant_calls));
+end
+fprintf('Proposed DP validation max |x|, |y| = [%.4f %.4f %.4f]\n', ...
+    results.dp.max_abs_x(1), results.dp.max_abs_x(2), results.dp.max_abs_y);
+fprintf('Proposed DP validation max |e_x|, |e_y| = [%.4e %.4e %.4e]\n', ...
+    results.dp.max_abs_ex(1), results.dp.max_abs_ex(2), results.dp.max_abs_ey);
+
+fprintf('\n=== LaTeX quantizer-type comparison table ===\n');
+fprintf('Method & mean $J_{\\gamma}$ & std $J_{\\gamma}$ & mean surr. & std surr. \\\\'); fprintf('\n');
+for im = 1:numel(methods)
+    nm = methods{im};
+    r = results.(nm);
+    prettyName = method_pretty_name(nm);
+    fprintf('%s & %.4f & %.4f & %.4f & %.4f \\\\', ...
+        prettyName, mean(r.Ju), std(r.Ju), mean(r.Jsurr), std(r.Jsurr));
+    fprintf('\n');
 end
 
 %% ===========================
@@ -536,14 +662,18 @@ figure('Name','LCSS')
 
 % subplot(2,3,[1,2,3]), hold on; grid on;
 subplot(3,3,[1,2,3]), hold on; grid on;
-plot(t(idxTail), rseq(idxTail), '--', 'LineWidth', 1.2);
+plot(t(idxTail), rseq(idxTail), 'k--', 'LineWidth', 1.2);
 % plot(t(idxTail), y_id(idxTail), 'k', 'LineWidth', 1.3);
 for im = 1:numel(methods)
     nm = methods{im};
     if im == 4
-        plot(t(idxTail), traj.(nm).y(idxTail), 'b', 'LineWidth', 1.0);
+        plot(t(idxTail), traj.(nm).y(idxTail), 'b', 'LineWidth', 1.5);
+    elseif im == 1
+        plot(t(idxTail), traj.(nm).y(idxTail), 'r', 'LineWidth', 1.5);
+    elseif im == 2
+        plot(t(idxTail), traj.(nm).y(idxTail), 'g ', 'LineWidth', 1.5);
     else
-        plot(t(idxTail), traj.(nm).y(idxTail), 'r', 'LineWidth', 1.0);
+        plot(t(idxTail), traj.(nm).y(idxTail), 'c', 'LineWidth', 1.5);
     end
 end
 % legend(cell(['ref','ideal',methods]), 'Location','best');
@@ -728,6 +858,295 @@ function c0 = weighted_quantile_init(s,w,N)
     c0 = sort(c0);
 end
 
+function opt = design_surrogate_level_allocation( ...
+    x1_samples, x2_samples, y_samples, w_x1, w_x2, w_y, ...
+    Sx, Sy, Ntot, NminAlloc, designMaxSamples, label)
+% Globally allocate the total level budget for the sampled separable surrogate.
+% Phi_l(N) is the globally optimal weighted scalar DP cost for channel l.
+    if nargin < 12 || isempty(label)
+        label = 'sampled separable surrogate';
+    end
+
+    [x1_design, w_x1_design] = deterministic_subset(x1_samples, w_x1, designMaxSamples);
+    [x2_design, w_x2_design] = deterministic_subset(x2_samples, w_x2, designMaxSamples);
+    [y_design,  w_y_design]  = deterministic_subset(y_samples,  w_y,  designMaxSamples);
+
+    nChannels = 3;
+    NmaxAlloc = Ntot - (nChannels - 1) * NminAlloc;
+
+    fprintf('\n=== Data-driven level allocation: %s ===\n', label);
+    fprintf('Computing Phi_l(N) curves with %d samples/channel, N in [%d,%d]\n', ...
+        numel(x1_design), NminAlloc, NmaxAlloc);
+
+    curves = cell(1,nChannels);
+    curves{1} = dp1d_cost_curve(x1_design, w_x1_design, Sx(1), NmaxAlloc);
+    curves{2} = dp1d_cost_curve(x2_design, w_x2_design, Sx(2), NmaxAlloc);
+    curves{3} = dp1d_cost_curve(y_design,  w_y_design,  Sy,    NmaxAlloc);
+
+    [Nbest, bestCost] = optimize_level_allocation_dp(curves, Ntot, NminAlloc);
+
+    fprintf('Global sampled-surrogate allocation: [%d %d %d], cost %.6e\n', ...
+        Nbest(1), Nbest(2), Nbest(3), bestCost);
+
+    opt = struct();
+    opt.Nbest = Nbest;
+    opt.bestCost = bestCost;
+    opt.curves = curves;
+    opt.Nmin = NminAlloc;
+    opt.Nmax = NmaxAlloc;
+    opt.designMaxSamples = designMaxSamples;
+    opt.label = label;
+end
+
+function J = dp1d_cost_curve(samples, weights, S_s, Nmax)
+% Cost curve J(N): globally optimal weighted 1D N-level DP SSE.
+    fprintf('>> Computing DP cost curve up to N=%d\n', Nmax)
+
+    s = samples(:);
+    w = weights(:);
+
+    msk = isfinite(s) & isfinite(w) & (w > 0) & (s >= -S_s) & (s <= S_s);
+    s = s(msk);
+    w = w(msk);
+    if isempty(s)
+        error('No valid samples for DP cost curve.');
+    end
+
+    [s, ord] = sort(s, 'ascend');
+    w = w(ord);
+
+    [su, ~, ic] = unique(s, 'stable');
+    if numel(su) < numel(s)
+        w = accumarray(ic, w);
+        s = su;
+    end
+
+    M = numel(s);
+    Nmax = min(Nmax, M);
+
+    Wp  = [0; cumsum(w)];
+    Sp  = [0; cumsum(w .* s)];
+    S2p = [0; cumsum(w .* (s.^2))];
+    cost = @(i,j) segment_cost(i,j,Wp,Sp,S2p);
+
+    J = inf(Nmax,1);
+    dp_prev = inf(M,1);
+    for j = 1:M
+        dp_prev(j) = cost(1,j);
+    end
+    J(1) = dp_prev(M);
+
+    for k = 2:Nmax
+        dp_cur = inf(M,1);
+        optk = zeros(M,1,'uint32');
+        [dp_cur, ~] = compute_row_dc(k, M, k-1, M-1, dp_prev, cost, dp_cur, optk);
+        dp_prev = dp_cur;
+        J(k) = dp_prev(M);
+    end
+end
+
+function [Nbest, bestCost] = optimize_level_allocation_dp(curves, Ntot, NminAlloc)
+% Dynamic program over channels and total budget.
+    nChannels = numel(curves);
+    D = inf(nChannels + 1, Ntot + 1);
+    prevN = zeros(nChannels + 1, Ntot + 1);
+    D(1,1) = 0; % zero channels, zero budget
+
+    for ell = 1:nChannels
+        maxN = numel(curves{ell});
+        for b = 0:Ntot
+            if ~isfinite(D(ell,b+1))
+                continue;
+            end
+            remainingChannels = nChannels - ell;
+            Nupper = min(maxN, Ntot - b - remainingChannels * NminAlloc);
+            for N = NminAlloc:Nupper
+                val = D(ell,b+1) + curves{ell}(N);
+                if val < D(ell+1,b+N+1)
+                    D(ell+1,b+N+1) = val;
+                    prevN(ell+1,b+N+1) = N;
+                end
+            end
+        end
+    end
+
+    bestCost = D(nChannels+1,Ntot+1);
+    if ~isfinite(bestCost)
+        error('No feasible level allocation found.');
+    end
+
+    Nbest = zeros(1,nChannels);
+    b = Ntot;
+    for ell = nChannels:-1:1
+        Nbest(ell) = prevN(ell+1,b+1);
+        b = b - Nbest(ell);
+    end
+end
+
+function summary = allocation_perturb_observe( ...
+    A, B, C, Kx, Kz, Ts, Qdelta, R, gamma, Wx_u, Wy_u, ...
+    refCfg, Heval, Sx, Sy, Nprop, Ntot, ...
+    x1_samples, x2_samples, y_samples, w_x1, w_x2, w_y, ...
+    testset, refSeq, designMaxSamples, N_highrate, N_signal)
+% Redesign DP quantizers under perturbed level allocations and evaluate both
+% the full training surrogate and validation closed-loop costs.
+
+    NminAlloc = 16;
+
+    [x1_design, w_x1_design] = deterministic_subset(x1_samples, w_x1, designMaxSamples);
+    [x2_design, w_x2_design] = deterministic_subset(x2_samples, w_x2, designMaxSamples);
+    [y_design,  w_y_design]  = deterministic_subset(y_samples,  w_y,  designMaxSamples);
+
+    allocRows = zeros(0,3);
+    allocNames = {};
+
+    allocRows(end+1,:) = Nprop;
+    allocNames{end+1} = 'data-opt';
+
+    if nargin >= 27 && ~isempty(N_highrate) && ~ismember(N_highrate, allocRows, 'rows')
+        allocRows(end+1,:) = N_highrate;
+        allocNames{end+1} = 'highrate';
+    end
+
+    if nargin >= 28 && ~isempty(N_signal) && ~ismember(N_signal, allocRows, 'rows')
+        allocRows(end+1,:) = N_signal;
+        allocNames{end+1} = 'signal-only';
+    end
+
+    Nequal = floor(Ntot/3) * ones(1,3);
+    Nequal(1:(Ntot - sum(Nequal))) = Nequal(1:(Ntot - sum(Nequal))) + 1;
+    if all(Nequal >= NminAlloc) && ~ismember(Nequal, allocRows, 'rows')
+        allocRows(end+1,:) = Nequal;
+        allocNames{end+1} = 'equal';
+    end
+
+    perturbDeltas = [20 40];
+    perturbDirs = [
+         1 -1  0;
+        -1  1  0;
+         1  0 -1;
+        -1  0  1;
+         0  1 -1;
+         0 -1  1
+    ];
+    perturbNames = {'x1<-x2','x2<-x1','x1<-y','y<-x1','x2<-y','y<-x2'};
+
+    for id = 1:size(perturbDirs,1)
+        for dd = perturbDeltas
+            Ntry = Nprop + dd * perturbDirs(id,:);
+            if all(Ntry >= NminAlloc) && sum(Ntry) == Ntot && ...
+                    ~ismember(Ntry, allocRows, 'rows')
+                allocRows(end+1,:) = Ntry;
+                allocNames{end+1} = sprintf('%s %d', perturbNames{id}, dd);
+            end
+        end
+    end
+
+    nAlloc = size(allocRows,1);
+    allocTrain = zeros(nAlloc,1);
+    allocJuMean = zeros(nAlloc,1);
+    allocJuStd = zeros(nAlloc,1);
+    allocJsMean = zeros(nAlloc,1);
+    allocJsStd = zeros(nAlloc,1);
+    allocOvr = zeros(nAlloc,1);
+
+    fprintf('\n=== Allocation perturb-and-observe sensitivity ===\n');
+    fprintf('DP redesign subset: %d samples/channel, validation trajectories: %d\n', ...
+        numel(x1_design), size(testset,1));
+    fprintf('Allocation             [Nx1 Nx2 Ny]   train surr.   rel train   avg Jgamma   avg Jsurr   overload\n');
+
+    for ia = 1:nAlloc
+        Ntry = allocRows(ia,:);
+        fprintf('\n>> Allocation %d/%d: %s [%d %d %d]\n', ...
+            ia, nAlloc, allocNames{ia}, Ntry(1), Ntry(2), Ntry(3));
+
+        qalloc = struct();
+        qalloc.x{1} = design_dp1d_quantizer(x1_design, w_x1_design, Sx(1), Ntry(1));
+        qalloc.x{2} = design_dp1d_quantizer(x2_design, w_x2_design, Sx(2), Ntry(2));
+        qalloc.y{1} = design_dp1d_quantizer(y_design,  w_y_design,  Sy,    Ntry(3));
+
+        allocTrain(ia) = weighted_sse(x1_samples, w_x1, qalloc.x{1}) + ...
+                         weighted_sse(x2_samples, w_x2, qalloc.x{2}) + ...
+                         weighted_sse(y_samples,  w_y,  qalloc.y{1});
+
+        outAlloc = evaluate_quantized_case_ref( ...
+            A, B, C, Kx, Kz, Ts, Qdelta, R, gamma, ...
+            Wx_u, Wy_u, qalloc, testset, Heval, refCfg, Sx, Sy, refSeq);
+
+        allocJuMean(ia) = mean(outAlloc.Ju);
+        allocJuStd(ia)  = std(outAlloc.Ju);
+        allocJsMean(ia) = mean(outAlloc.Jsurr);
+        allocJsStd(ia)  = std(outAlloc.Jsurr);
+        allocOvr(ia)    = outAlloc.overload_count / max(1, outAlloc.total_quant_calls);
+    end
+
+    propIdx = find(all(allocRows == Nprop, 2), 1, 'first');
+    propTrain = allocTrain(propIdx);
+
+    fprintf('\nAllocation             [Nx1 Nx2 Ny]   train surr.   rel train   avg Jgamma   avg Jsurr   overload\n');
+    for ia = 1:nAlloc
+        fprintf('%-22s [%3d %3d %3d]   %.6e   %8.3f   %.6e   %.6e   %.4f\n', ...
+            allocNames{ia}, allocRows(ia,1), allocRows(ia,2), allocRows(ia,3), ...
+            allocTrain(ia), allocTrain(ia)/propTrain, ...
+            allocJuMean(ia), allocJsMean(ia), allocOvr(ia));
+    end
+
+    fprintf('\n=== LaTeX allocation sensitivity table ===\n');
+    fprintf('Allocation & $(N_{x,1},N_{x,2},N_y)$ & Rel. train surr. & $J_{\\gamma}$ & Surr. \\\\'); fprintf('\n');
+    principal = {'data-opt','highrate','signal-only','equal'};
+    pretty = {'Proposed','High-rate','Signal-only','Equal'};
+    for ip = 1:numel(principal)
+        idxp = find(strcmp(allocNames, principal{ip}), 1, 'first');
+        if isempty(idxp)
+            continue;
+        end
+        fprintf('%s & $(%d,%d,%d)$ & %.3f & %.3f & %.3f \\\\', ...
+            pretty{ip}, allocRows(idxp,1), allocRows(idxp,2), allocRows(idxp,3), ...
+            allocTrain(idxp)/propTrain, allocJuMean(idxp), allocJsMean(idxp));
+        fprintf('\n');
+    end
+
+    figure('Name','Allocation perturb-and-observe sensitivity');
+    tiledlayout(2,1);
+    nexttile; bar(allocTrain / propTrain); grid on;
+    ylabel('Train surrogate / proposed');
+    set(gca,'XTick',1:nAlloc,'XTickLabel',allocNames,'XTickLabelRotation',30);
+    title('Allocation sensitivity: training surrogate');
+
+    nexttile; hold on; grid on;
+    bar([allocJuMean / allocJuMean(propIdx), allocJsMean / allocJsMean(propIdx)]);
+    ylabel('Validation cost / proposed');
+    legend({'J_\gamma','Theorem surrogate'}, 'Location','best');
+    set(gca,'XTick',1:nAlloc,'XTickLabel',allocNames,'XTickLabelRotation',30);
+    title(sprintf('Validation costs on %d trajectories', size(testset,1)));
+
+    summary = struct();
+    summary.names = allocNames;
+    summary.allocations = allocRows;
+    summary.train = allocTrain;
+    summary.JuMean = allocJuMean;
+    summary.JuStd = allocJuStd;
+    summary.JsMean = allocJsMean;
+    summary.JsStd = allocJsStd;
+    summary.overload = allocOvr;
+    summary.propIdx = propIdx;
+end
+
+function [s_sub, w_sub] = deterministic_subset(s, w, maxSamples)
+    s = s(:);
+    w = w(:);
+    n = numel(s);
+    nKeep = min(n, maxSamples);
+    if nKeep == n
+        s_sub = s;
+        w_sub = w;
+        return;
+    end
+    idx = unique(round(linspace(1, n, nKeep))).';
+    s_sub = s(idx);
+    w_sub = w(idx);
+end
+
 function q = design_dp1d_quantizer(samples, weights, S_s, N)
 % Globally optimal weighted 1D N-level scalar quantizer (memory-safe DP)
 % samples : Mx1
@@ -904,6 +1323,25 @@ function J = weighted_sse(s, w, q)
     J = sum(w(:) .* (err.^2));
 end
 
+function emax = max_cell_error(q)
+    emax = 0.5 * max(diff(q.b(:)));
+end
+
+function name = method_pretty_name(nm)
+    switch lower(nm)
+        case 'uniform'
+            name = 'Uniform';
+        case 'log'
+            name = 'Logarithmic';
+        case 'kmeans'
+            name = 'Lloyd-Max';
+        case 'dp'
+            name = 'Proposed DP';
+        otherwise
+            name = nm;
+    end
+end
+
 function qv = quantize_vec(v, q)
     % Saturating scalar quantizer, vectorized
     v = v(:);
@@ -1004,6 +1442,95 @@ function r = reference_at_k(k, refCfg)
     end
 end
 
+function r = regularized_reference_at_k(k, refCfg)
+    r = reference_at_k(k, refCfg);
+    pReg = getfield_with_default(refCfg, 'trainPerturbProb', 0);
+    frac = getfield_with_default(refCfg, 'trainPerturbFrac', 0);
+    if frac > 0 && rand(1) < pReg
+        r = r .* (1 + frac * (2*rand(size(r)) - 1));
+    end
+end
+
+function Rseq = sample_reference_sequences(nTraj, H, refCfg, useRegularized)
+    if nargin < 4
+        useRegularized = false;
+    end
+    Rseq = zeros(nTraj, H+1);
+    for tr = 1:nTraj
+        for k = 0:H
+            if useRegularized
+                Rseq(tr,k+1) = regularized_reference_at_k(k, refCfg);
+            else
+                Rseq(tr,k+1) = reference_at_k(k, refCfg);
+            end
+        end
+    end
+end
+
+function rbar = reference_bound_over_horizon(refCfg, H)
+    rmax = 0;
+    for k = 0:H
+        rmax = max(rmax, max(abs(reference_at_k(k, refCfg))));
+    end
+    frac = getfield_with_default(refCfg, 'trainPerturbFrac', 0);
+    rbar = (1 + frac) * rmax;
+end
+
+function [X, Y, cert] = no_saturation_range_certificate( ...
+    Acl, E, Gx, Gy, Hx, Hy, xi0bar, rbar, ebar_x, ebar_y)
+% Component-wise implementation of the no-saturation certificate.
+    tol = 1e-11;
+    Kmax = 20000;
+    nAug = size(Acl,1);
+
+    H = {Hx, Hy};
+    beta = cell(1,2);
+    GammaR = cell(1,2);
+    GammaX = cell(1,2);
+    GammaY = cell(1,2);
+    for ih = 1:2
+        beta{ih} = zeros(size(H{ih},1),1);
+        GammaR{ih} = zeros(size(H{ih},1),size(E,2));
+        GammaX{ih} = zeros(size(H{ih},1),size(Gx,2));
+        GammaY{ih} = zeros(size(H{ih},1),size(Gy,2));
+    end
+
+    Ak = eye(nAug);
+    tailNorm = inf;
+    kStop = Kmax;
+    for k = 0:Kmax
+        for ih = 1:2
+            HAk = H{ih} * Ak;
+            beta{ih} = max(beta{ih}, abs(HAk) * xi0bar(:));
+            GammaR{ih} = GammaR{ih} + abs(HAk * E);
+            GammaX{ih} = GammaX{ih} + abs(HAk * Gx);
+            GammaY{ih} = GammaY{ih} + abs(HAk * Gy);
+        end
+
+        Ak = Ak * Acl;
+        tailNorm = norm(Ak, inf);
+        if tailNorm < tol
+            kStop = k;
+            break;
+        end
+    end
+
+    X = beta{1} + GammaR{1} * rbar(:) + GammaX{1} * ebar_x(:) + GammaY{1} * ebar_y(:);
+    Y = beta{2} + GammaR{2} * rbar(:) + GammaX{2} * ebar_x(:) + GammaY{2} * ebar_y(:);
+
+    cert = struct();
+    cert.beta_x = beta{1};
+    cert.beta_y = beta{2};
+    cert.Gamma_x_r = GammaR{1};
+    cert.Gamma_y_r = GammaR{2};
+    cert.Gamma_x_x = GammaX{1};
+    cert.Gamma_y_x = GammaX{2};
+    cert.Gamma_x_y = GammaY{1};
+    cert.Gamma_y_y = GammaY{2};
+    cert.kStop = kStop;
+    cert.tailNorm = tailNorm;
+end
+
 function v = getfield_with_default(s, fname, vdefault)
     if isfield(s, fname), v = s.(fname); else, v = vdefault; end
 end
@@ -1025,10 +1552,7 @@ function data = collect_ideal_dataset_ref(A,B,C,Kx,Kz,Ts,nTraj,H,x0_box,z0_box,g
 
         for k = 0:H
             y = C*x;
-            r = reference_at_k(k, refCfg);
-            if rand(1) < 1e-1
-                r = r*(1+randn(1));  % disturb ref a bit
-            end
+            r = regularized_reference_at_k(k, refCfg);
 
             R = [R; r];
             X = [X; x.'];
@@ -1036,15 +1560,8 @@ function data = collect_ideal_dataset_ref(A,B,C,Kx,Kz,Ts,nTraj,H,x0_box,z0_box,g
             W = [W; gamma^k];
 
             u = Kx*x + Kz*z;              % ideal controller state for this reference
-            if rand(1) < 1e-2
-                r = r*(1+randn(1)*1e-2);  % disturb ref a bit
-            end
-            wk = zeros(2,1);
-            if rand(1) < 1e-2
-                wk = r*(1+randn(2,1)*1e-2);  % disturb states a bit
-            end
             
-            x_next = A*x + B*u+wk;
+            x_next = A*x + B*u;
             z_next = z + Ts*(r - y);      % ideal integrator uses unquantized y
 
             x = x_next; z = z_next;
@@ -1067,13 +1584,20 @@ function data = collect_ideal_dataset_ref(A,B,C,Kx,Kz,Ts,nTraj,H,x0_box,z0_box,g
     subplot(414),plot(data.r)
 end
 
-function out = evaluate_quantized_case_ref(A,B,C,Kx,Kz,Ts,Qdelta,R,gamma,Wx_u,Wy_u,qbundle,testset,Heval,refCfg,Sx,Sy)
+function out = evaluate_quantized_case_ref(A,B,C,Kx,Kz,Ts,Qdelta,R,gamma,Wx_u,Wy_u,qbundle,testset,Heval,refCfg,Sx,Sy,refSeq)
+    if nargin < 18
+        refSeq = [];
+    end
     nTraj = size(testset,1);
     Ju = zeros(nTraj,1);
     Js = zeros(nTraj,1);
 
     overload_count = 0;
     total_quant_calls = 0;
+    max_abs_ex = zeros(2,1);
+    max_abs_ey = 0;
+    max_abs_x = zeros(2,1);
+    max_abs_y = 0;
 
     for tr = 1:nTraj
         xi_q   = testset(tr,:).';  % [x1;x2;z]
@@ -1083,7 +1607,11 @@ function out = evaluate_quantized_case_ref(A,B,C,Kx,Kz,Ts,Qdelta,R,gamma,Wx_u,Wy
         J2 = 0;
 
         for k = 0:Heval
-            r = reference_at_k(k, refCfg);
+            if isempty(refSeq)
+                r = reference_at_k(k, refCfg);
+            else
+                r = refSeq(tr,k+1);
+            end
 
             % Quantized system state
             x = xi_q(1:2);
@@ -1114,6 +1642,10 @@ function out = evaluate_quantized_case_ref(A,B,C,Kx,Kz,Ts,Qdelta,R,gamma,Wx_u,Wy
             du = u - us;
             ex = xq - x;
             ey = yq - y;
+            max_abs_ex = max(max_abs_ex, abs(ex));
+            max_abs_ey = max(max_abs_ey, abs(ey));
+            max_abs_x = max(max_abs_x, abs(x));
+            max_abs_y = max(max_abs_y, abs(y));
 
             % old; u only
             % J1 = J1 + (gamma^k) * (du' * R * du);
@@ -1149,6 +1681,10 @@ function out = evaluate_quantized_case_ref(A,B,C,Kx,Kz,Ts,Qdelta,R,gamma,Wx_u,Wy
     out.Jsurr = Js;
     out.overload_count = overload_count;
     out.total_quant_calls = total_quant_calls;
+    out.max_abs_ex = max_abs_ex;
+    out.max_abs_ey = max_abs_ey;
+    out.max_abs_x = max_abs_x;
+    out.max_abs_y = max_abs_y;
 end
 
 function traj = simulate_single_trajectory_ref(A,B,C,Kx,Kz,Ts,R,gamma,Wx_u,Wy_u,qbundle,x0_aug,Heval,refCfg)
@@ -1217,24 +1753,39 @@ function plot_centroid_stems(Qset, methods, figTitle, xyTag, idxChan)
     title(['Centroid spacing: ', figTitle]);
 end
 
+% function plot_centroid_stems_LCSS(Qset, methods, figTitle, xyTag, idxChan)
+%     hold on; grid on;
+% 
+%     yLevels = 1:numel(methods);
+%     for im = 4:numel(methods)
+%         nm = methods{im};
+%         q = Qset.(nm).(xyTag){idxChan};
+%         c = q.c(:).';
+%         % stem(c, ones(size(c)), 'filled', 'LineWidth', 0.5);
+%         stem(c, ones(size(c)), 'filled', 'LineWidth', 1);
+%         % stem([0,diff(c)], yLevels(im)*ones(size(c)), 'filled', 'LineWidth', 1.0);  % see where it's dense
+%         % stem(c, yLevels(im)*[0,diff(c)], 'filled', 'LineWidth', 1.0);  % centroid density
+%     end
+%     % legend(methods, 'Location','best');
+%     % set(gca, 'YTick', yLevels, 'YTickLabel', methods);
+%     % xlabel('centroid location');
+%     % ylabel('Centroid spacing');
+%     % title(['Centroid spacing: ', figTitle]);
+% end
+
 function plot_centroid_stems_LCSS(Qset, methods, figTitle, xyTag, idxChan)
     hold on; grid on;
 
-    yLevels = 1:numel(methods);
-    for im = 4:numel(methods)
-        nm = methods{im};
-        q = Qset.(nm).(xyTag){idxChan};
-        c = q.c(:).';
-        % stem(c, ones(size(c)), 'filled', 'LineWidth', 0.5);
-        stem(c, ones(size(c)), 'filled', 'LineWidth', 1);
-        % stem([0,diff(c)], yLevels(im)*ones(size(c)), 'filled', 'LineWidth', 1.0);  % see where it's dense
-        % stem(c, yLevels(im)*[0,diff(c)], 'filled', 'LineWidth', 1.0);  % centroid density
-    end
-    % legend(methods, 'Location','best');
-    % set(gca, 'YTick', yLevels, 'YTickLabel', methods);
-    % xlabel('centroid location');
-    % ylabel('Centroid spacing');
-    % title(['Centroid spacing: ', figTitle]);
+    nm = 'dp';
+    q = Qset.(nm).(xyTag){idxChan};
+    c = q.c(:).';
+
+    maxStems = 200;
+    stride = max(1, ceil(numel(c)/maxStems));
+    idx = 1:stride:numel(c);
+
+    stem(c(idx), ones(size(idx)), 'filled', ...
+        'LineWidth', 0.8, 'MarkerSize', 3);
 end
 
 % function plot_centroid_stems_diff(Qset, methods, figTitle, xyTag, idxChan)
