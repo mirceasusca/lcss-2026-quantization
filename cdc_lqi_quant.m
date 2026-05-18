@@ -1,16 +1,92 @@
-%% case_study_quantized_lqi_dp.m
-% Quantized LQI case study (2nd-order SISO)
-% Compares scalar quantizer designs:
-%   - Uniform
-%   - Logarithmic (mu-law companded)
-%   - Lloyd / K-means (1D weighted)
-%   - Dynamic Programming (globally optimal weighted 1D)
-
-% DONE: Works correctly if you let the steady-state stay enough 
-% in the trajectory
-% DONE: define a number of full trajectories + 
-% define a number of initializations to the first part of the trajectory
-% DONE: added regularization through reference definition and state update
+%% cdc_lqi_quant.m
+% Reproducibility script for the L-CSS/CDC case study:
+% "Performance-Aware Quantizer Synthesis for LQI Tracking Subject to Fixed
+% Level Budgets".
+%
+% This script implements the complete numerical pipeline used in the revised
+% manuscript for the open-loop unstable second-order SISO example. The
+% measured channels are (x1, x2, y), and each one is assigned an independent
+% scalar finite-level quantizer.
+%
+% Main functionality:
+%   1) Define the discrete-time plant (A,B,C,D), sampling period Ts, and
+%      LQI/LQR weights Qaug, R.
+%   2) Compute the LQI feedback gains Kx, Kz and the nominal closed-loop
+%      matrix Acl.
+%   3) Generate the mixed step-ramp-sine reference used in the manuscript.
+%   4) Collect ideal unquantized LQI trajectories for training.
+%   5) Apply bounded multiplicative reference regularization:
+%          r_reg = r * (1 + delta), delta in [-0.5,0.5],
+%      when the perturbation event is active.
+%   6) Compute the discounted Lyapunov sensitivity matrices Wx, Wy and the
+%      scalar row-sum weights alpha_l used in the separable surrogate.
+%   7) Certify quantizer operating ranges using the no-saturation certificate
+%      from the manuscript, then recheck the certificate after DP design.
+%   8) Compute globally optimal scalar DP cost curves Phi_l(N) on a
+%      deterministic subset of the training samples.
+%   9) Allocate the fixed total level budget Ntot across (x1,x2,y) by a
+%      second dynamic program.
+%  10) Design scalar quantizers for each channel using four constructions:
+%          - uniform;
+%          - logarithmic mu-law companding;
+%          - Lloyd-Max / weighted 1D k-means;
+%          - globally optimal weighted 1D dynamic programming.
+%  11) Evaluate the quantized closed loop on independently sampled validation
+%      trajectories and independently perturbed references.
+%  12) Print LaTeX-ready statistics for the allocation-sensitivity and
+%      quantizer-type comparison tables.
+%  13) Generate tracking, histogram, centroid, and quantizer comparison plots.
+%
+% Main experiment parameters to edit:
+%   A, B, C, D              plant matrices for the case study;
+%   Ts                      sampling period;
+%   Qaug, R                 LQI/LQR design weights;
+%   refCfg                  reference profile and perturbation settings;
+%   x0_box, z0_box          training initial-condition ranges;
+%   nTrainTraj              number of training trajectories;
+%   nTestTraj               number of validation trajectories;
+%   gamma                   discount factor in J_gamma and the surrogate;
+%   Ntot                    total scalar quantization-level budget;
+%   NminAlloc               minimum number of levels per channel;
+%   allocDesignMaxSamples   deterministic subset size for Phi_l(N) curves;
+%   runAllocationSensitivityOnly
+%                           if true, stops after allocation sensitivity.
+%
+% Saved experiment data:
+%   The numerical data corresponding to the current revised experiment are
+%   stored in exp_LCSS_2026_05_17.mat.
+%
+% Scalability note:
+%   The mathematical framework in the manuscript supports general dimensions
+%   (n,m,p). This script, however, is a transparent case-study
+%   implementation for n=2, m=1, p=1. Several parts below are intentionally
+%   hard-coded for the three scalar channels (x1,x2,y), including sample
+%   extraction, level-allocation rows, quantizer storage, validation loops,
+%   and plotting. The scalar DP routines design_dp1d_quantizer,
+%   dp1d_cost_curve, and optimize_level_allocation_dp are reusable, but the
+%   surrounding experiment script would need vectorization before being used
+%   as a general MIMO/n-output toolbox.
+%
+% Generalization checklist, if this is later converted to a toolbox:
+%   - replace x1_samples, x2_samples, y_samples by a cell array over all
+%     n+p measured scalar channels;
+%   - replace Sx/Sy scalar handling by S = [X_1,...,X_n,Y_1,...,Y_p];
+%   - replace nChannels = 3 by nChannels = n+p in allocation wrappers;
+%   - store quantizers as Qset.method.channel{ell} rather than x{1},x{2},y{1};
+%   - loop over all state and output quantizers in closed-loop evaluation;
+%   - handle vector outputs y, references r, and integrator states z when
+%     p > 1;
+%   - adapt command plots and statistics for m > 1;
+%   - replace the x1/x2/y-specific figures by looped or selected-channel
+%     visualizations.
+%
+% Runtime note:
+%   The full script can take some time to run because it performs several
+%   stages: trajectory generation, scalar DP cost-curve computation for
+%   allocation, DP quantizer redesigns for allocation sensitivity, closed-loop
+%   validation, and figure generation. To inspect only the allocation
+%   sensitivity stage, set runAllocationSensitivityOnly = true before running
+%   the script.
 
 if ~exist('runAllocationSensitivityOnly','var')
     runAllocationSensitivityOnly = false;
@@ -204,7 +280,10 @@ Ntot = 384;
 train = collect_ideal_dataset_ref(A, B, C, Kx, Kz, Ts, nTrainTraj, ...
     Htrain, x0_box, z0_box, gamma, refCfg);
 
-% Training arrays
+% Training arrays for the three scalar measurement channels of this case
+% study. This is one of the main case-specific blocks: a general version
+% would build samples{ell}, weights{ell}, ranges S(ell), and labels{ell}
+% for ell = 1,...,n+p.
 x1_samples = train.x(:,1);
 x2_samples = train.x(:,2);
 y_samples  = train.y(:);
@@ -232,6 +311,10 @@ Hy_cert = [C, zeros(p,p)];
 Sx = max(Sx_data(:), Sx_cert(:)).';
 Sy = max(Sy_data, Sy_cert);
 
+% The printed ranges correspond to the paper's (X1,X2,Y1). The certificate
+% uses a preliminary uniform error envelope only to obtain a constructive
+% operating range; after the final nonuniform DP quantizers are designed, the
+% certificate is rechecked with their actual maximum cell errors.
 fprintf('\n=== Lemma range certificate ===\n');
 fprintf('xi0bar = [%.4f %.4f %.4f], rbar = %.4f\n', xi0bar(1), xi0bar(2), xi0bar(3), rbar);
 fprintf('preliminary ebar = [%.4e %.4e %.4e]\n', prelim_ebar_x(1), prelim_ebar_x(2), prelim_ebar_y);
@@ -261,6 +344,9 @@ assert(all(abs(y_samples)  <= Sy   +1e-12));
 % High-rate allocation baseline (classical DSP-inspired rule).
 % Alternative total budgets used in previous sweeps:
 % Ntot = 768; Ntot = 320; Ntot = 256; Ntot = 192;
+% This is the closed-form DSP-inspired approximation N_l proportional to
+% (alpha_l*S_l^2)^(1/3). It is kept as an allocation baseline, not as the
+% proposed method.
 % % %
 % Qdelta2 = Qaug*0; 
 Qdelta2 = Qaug;
@@ -292,6 +378,9 @@ w_y  = omega_t * alpha_y(1);
 
 % Data-driven globally optimal level allocation for the sampled separable
 % surrogate: min sum_l Phi_l(N_l), sum_l N_l = Ntot.
+% For each channel, Phi_l(N) is computed by a scalar DP over a deterministic
+% subset of samples. Then a second DP allocates the total integer level
+% budget across channels. In the paper this is Proposition 2.
 useDataDrivenAllocation = true;
 allocDesignMaxSamples = 60000; % deterministic subset for fast allocation curves
 NminAlloc = 16;
@@ -343,6 +432,10 @@ testRefSeq = sample_reference_sequences(nTestTraj, Heval, refCfg, true);
 %% =============================================
 % 4) Design scalar quantizers (4 methods/channel)
 % =============================================
+% The following block designs each quantizer type channel-by-channel for
+% (x1,x2,y). The proposed DP design is globally optimal for each fixed
+% channel and fixed level count. Lloyd-Max is included as a locally optimal
+% nonuniform baseline and is therefore initialization-dependent.
 methods = {'uniform','log','kmeans','dp'};
 Qset = struct();
 
@@ -354,6 +447,10 @@ Qset = struct();
 runAllocSensitivity = true;
 
 if runAllocSensitivity
+    % Allocation sensitivity keeps the scalar quantizer class fixed to DP and
+    % changes only the level allocation. This isolates the contribution of
+    % the proposed performance-aware allocation layer from the contribution
+    % of nonuniform scalar centroid placement.
     % allocEvalTraj = min(60, nTestTraj);
     allocEvalTraj = nTestTraj;
     allocDesignMaxSamples = 60000; % deterministic subset for fast DP redesigns
@@ -863,6 +960,15 @@ function opt = design_surrogate_level_allocation( ...
     Sx, Sy, Ntot, NminAlloc, designMaxSamples, label)
 % Globally allocate the total level budget for the sampled separable surrogate.
 % Phi_l(N) is the globally optimal weighted scalar DP cost for channel l.
+%
+% Case-study-specific interface:
+%   This wrapper assumes exactly three scalar channels: x1, x2, and y. It is
+%   the implementation used to obtain the allocation (201,77,106) in the
+%   paper. The generic logic is the pair:
+%       curves{ell} = dp1d_cost_curve(samples{ell}, weights{ell}, S(ell), Nmax)
+%       optimize_level_allocation_dp(curves, Ntot, NminAlloc)
+%   so a general n+p channel version would only need to build these cell
+%   arrays in a loop.
     if nargin < 12 || isempty(label)
         label = 'sampled separable surrogate';
     end
@@ -900,6 +1006,11 @@ end
 
 function J = dp1d_cost_curve(samples, weights, S_s, Nmax)
 % Cost curve J(N): globally optimal weighted 1D N-level DP SSE.
+%
+% This function computes the entire scalar cost curve Phi(N), N=1,...,Nmax.
+% It uses the same contiguous-segment DP structure as design_dp1d_quantizer,
+% but stores only the final optimal value for each N. These values feed the
+% outer level-allocation DP.
     fprintf('>> Computing DP cost curve up to N=%d\n', Nmax)
 
     s = samples(:);
@@ -947,6 +1058,16 @@ end
 
 function [Nbest, bestCost] = optimize_level_allocation_dp(curves, Ntot, NminAlloc)
 % Dynamic program over channels and total budget.
+%
+% Inputs:
+%   curves{ell}(N) is Phi_ell(N), the globally optimal scalar DP cost for
+%   assigning N levels to channel ell.
+%   Ntot is the total number of scalar quantization levels across channels.
+%   NminAlloc enforces a minimum number of levels per channel.
+%
+% Output:
+%   Nbest is the globally optimal integer allocation under the sampled
+%   separable surrogate, e.g., [201 77 106] for the current experiment.
     nChannels = numel(curves);
     D = inf(nChannels + 1, Ntot + 1);
     prevN = zeros(nChannels + 1, Ntot + 1);
@@ -990,6 +1111,13 @@ function summary = allocation_perturb_observe( ...
     testset, refSeq, designMaxSamples, N_highrate, N_signal)
 % Redesign DP quantizers under perturbed level allocations and evaluate both
 % the full training surrogate and validation closed-loop costs.
+%
+% This is a diagnostic/sensitivity routine for the manuscript tables. It is
+% not part of the core synthesis theorem. It keeps the quantizer class fixed
+% to the proposed scalar DP design and compares several allocations:
+% proposed, high-rate, signal-only, equal-level, and small budget transfers.
+% The printed table helps verify that the allocation chosen by the sampled
+% surrogate is meaningful on independently perturbed validation trajectories.
 
     NminAlloc = 16;
 
@@ -1153,6 +1281,18 @@ function q = design_dp1d_quantizer(samples, weights, S_s, N)
 % weights : Mx1, positive
 % range   : [-S_s, S_s]
 % N       : number of levels (1 <= N <= M)
+%
+% Output q:
+%   q.b contains the thresholds [b_0,...,b_N], including the prescribed
+%   endpoints -S_s and S_s.
+%   q.c contains the reproduction values/centroids [c_1,...,c_N].
+%   quantize_scalar maps cell [b_{i-1}, b_i) to c_i and saturates outside
+%   [-S_s,S_s]. Thus q.b and q.c are the finite-level scalar quantizer
+%   reported in Definition 1 of the manuscript.
+%
+% The DP exploits the fact that, for sorted 1D samples and squared-error
+% distortion, the globally optimal assignment is into contiguous segments.
+% Each segment is represented by its weighted mean centroid.
     disp('>> Designing DP quantizer')
 
     s = samples(:);
@@ -1443,6 +1583,12 @@ function r = reference_at_k(k, refCfg)
 end
 
 function r = regularized_reference_at_k(k, refCfg)
+% Reference regularization used for robustness-oriented training/validation.
+% With probability refCfg.trainPerturbProb, the nominal reference is scaled
+% by a bounded multiplicative factor:
+%       r_reg = r * (1 + delta),  delta in [-trainPerturbFrac, trainPerturbFrac].
+% For the manuscript experiment, trainPerturbFrac = 0.50 and
+% trainPerturbProb = 0.10.
     r = reference_at_k(k, refCfg);
     pReg = getfield_with_default(refCfg, 'trainPerturbProb', 0);
     frac = getfield_with_default(refCfg, 'trainPerturbFrac', 0);
@@ -1479,6 +1625,18 @@ end
 function [X, Y, cert] = no_saturation_range_certificate( ...
     Acl, E, Gx, Gy, Hx, Hy, xi0bar, rbar, ebar_x, ebar_y)
 % Component-wise implementation of the no-saturation certificate.
+%
+% This implements Lemma 1 from the manuscript. For H in {Hx,Hy}, it computes
+% finite approximations of
+%   beta_H    = sup_k |H*Acl^k|*xi0bar,
+%   Gamma_H_r = sum_k |H*Acl^k*E|,
+%   Gamma_H_x = sum_k |H*Acl^k*Gx|,
+%   Gamma_H_y = sum_k |H*Acl^k*Gy|.
+% The returned ranges are
+%   X = beta_Hx + Gamma_Hx_r*rbar + Gamma_Hx_x*ebar_x + Gamma_Hx_y*ebar_y,
+%   Y = beta_Hy + Gamma_Hy_r*rbar + Gamma_Hy_x*ebar_x + Gamma_Hy_y*ebar_y.
+% The infinite sums are truncated when norm(Acl^k,inf) is below tol. The
+% Schur property of Acl is checked earlier in the script.
     tol = 1e-11;
     Kmax = 20000;
     nAug = size(Acl,1);
@@ -1536,6 +1694,16 @@ function v = getfield_with_default(s, fname, vdefault)
 end
 
 function data = collect_ideal_dataset_ref(A,B,C,Kx,Kz,Ts,nTraj,H,x0_box,z0_box,gamma,refCfg)
+% Collect nominal unquantized LQI trajectories used for data-driven design.
+%
+% For every trajectory, x0 and z0 are sampled from the prescribed boxes and
+% the ideal LQI loop is simulated for k = 0,...,H. The stored samples are:
+%   data.x : state samples x_k;
+%   data.y : output samples y_k;
+%   data.r : reference samples r_k;
+%   data.w : discount-consistent weights gamma^k.
+% These samples define the empirical scalar objectives in Corollary 1.
+% In the current case study the reference is regularized during collection.
     n = size(A,1);
     X = [];
     Y = [];
@@ -1585,6 +1753,19 @@ function data = collect_ideal_dataset_ref(A,B,C,Kx,Kz,Ts,nTraj,H,x0_box,z0_box,g
 end
 
 function out = evaluate_quantized_case_ref(A,B,C,Kx,Kz,Ts,Qdelta,R,gamma,Wx_u,Wy_u,qbundle,testset,Heval,refCfg,Sx,Sy,refSeq)
+% Closed-loop validation for the case-study dimensions n=2, p=1.
+%
+% This function simulates, side by side, the quantized closed loop and the
+% ideal unquantized closed loop under the same reference sequence. It reports:
+%   Ju    : discounted trajectory/command degradation J_gamma;
+%   Jsurr : sampled version of the Theorem 2 surrogate;
+%   overload_count / total_quant_calls : observed saturation rate.
+%
+% Case-study-specific note:
+%   The state and output quantization below are explicitly written for
+%   channels (x1,x2,y). A dimension-generic version would replace these
+%   three scalar quantizer calls by loops over all n state channels and p
+%   output channels.
     if nargin < 18
         refSeq = [];
     end
